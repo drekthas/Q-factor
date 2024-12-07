@@ -1,0 +1,728 @@
+import os
+import sys
+import io
+import time
+import logging
+import requests
+import pandas as pd
+import streamlit as st
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+from ratelimit import limits, sleep_and_retry
+
+# ---------------------------------
+# Configuration and Logging
+# ---------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
+# SCOPUS API Configuration
+SCOPUS_API_KEY = os.environ.get('SCOPUS_API_KEY', '').strip()
+BASE_URL = 'https://api.elsevier.com'
+CALLS_PER_MINUTE = 6   # Adjust based on your API subscription tier
+MAX_RETRIES = 3
+BATCH_SIZE = 5
+
+class PermissionError(Exception):
+    """Custom exception for API permission errors."""
+    pass
+
+# ---------------------------------
+# Utility Functions (Previously in utils)
+# ---------------------------------
+def validate_excel_columns(df: pd.DataFrame) -> None:
+    """Validate that the uploaded Excel file has the required columns."""
+    required_columns = ['EID', 'Title']
+    if not all(col in df.columns for col in required_columns):
+        missing_cols = [col for col in required_columns if col not in df.columns]
+        raise ValueError(f"Missing required columns: {', '.join(missing_cols)}. "
+                         "File must have 'EID' and 'Title' columns.")
+
+def clean_article_title(title: str) -> str:
+    """Clean and format an article title."""
+    if not title:
+        return 'N/A'
+    title = str(title).strip()
+    title = ' '.join(title.split())  # Remove excessive whitespace
+    if title:
+        title = title[0].upper() + title[1:]
+    return title
+
+def parse_publication_date(date_str: str) -> (str, str):
+    """Parse and validate the publication date, returning a formatted date and year."""
+    try:
+        if not date_str or pd.isna(date_str):
+            return 'N/A', 'N/A'
+        parsed_date = pd.to_datetime(str(date_str).strip())
+        formatted_date = parsed_date.strftime('%Y-%m-%d')
+        year = str(parsed_date.year)
+        return formatted_date, year
+    except Exception as e:
+        logger.warning(f"Error parsing date {date_str}: {str(e)}")
+        return 'N/A', 'N/A'
+
+def process_excel_input(uploaded_file) -> List[Dict[str, str]]:
+    """
+    Process uploaded Excel file containing EIDs and titles.
+    Returns a list of articles with 'eid' and 'title'.
+    """
+    try:
+        df = pd.read_excel(uploaded_file, engine='openpyxl', dtype={'EID': str, 'Title': str})
+        validate_excel_columns(df)
+        df = df.fillna('')
+        if df.empty:
+            raise ValueError("Excel file is empty")
+
+        articles = []
+        for idx, row in df.iterrows():
+            try:
+                eid_value = str(row['EID']).strip()
+                title_value = clean_article_title(row['Title'])
+                if not eid_value or not title_value:
+                    logger.warning(f"Skipping row {idx}: Missing EID or Title")
+                    continue
+                articles.append({'eid': eid_value, 'title': title_value})
+            except Exception as e:
+                logger.warning(f"Error processing row {idx}: {str(e)}")
+                continue
+
+        if not articles:
+            raise ValueError("No valid articles found in the Excel file")
+
+        logger.info(f"Successfully processed {len(articles)} articles from Excel file")
+        return articles
+
+    except pd.errors.EmptyDataError:
+        logger.error("The uploaded Excel file is empty.")
+        raise ValueError("The uploaded Excel file is empty.")
+    except pd.errors.ParserError as e:
+        logger.error(f"Error parsing Excel file: {str(e)}")
+        raise ValueError(f"Invalid Excel file format: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error processing Excel file: {str(e)}")
+        raise Exception(f"Error processing Excel file: {str(e)}")
+
+def process_batch_citations(articles_list: List[Dict[str, str]], citing_data_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Process batch citations data, extracting relevant citation information."""
+    try:
+        if not articles_list or not citing_data_list:
+            logger.warning("Empty input received for batch processing.")
+            return []
+
+        if len(articles_list) != len(citing_data_list):
+            logger.error("Mismatch between articles and citing data lists.")
+            raise ValueError("Mismatch between articles and citing data lists.")
+
+        processed_data = []
+        for article, citing_data in zip(articles_list, citing_data_list):
+            if 'error' in citing_data:
+                logger.warning(f"Skipping article {article['eid']} due to error: {citing_data['error']}")
+                continue
+
+            if not isinstance(citing_data, dict) or 'citing-articles' not in citing_data:
+                continue
+
+            articles = citing_data['citing-articles'].get('article', [])
+            if not articles:
+                continue
+
+            for citing_article in articles:
+                title = clean_article_title(citing_article.get('dc:title', ''))
+                pub_date, year = parse_publication_date(citing_article.get('prism:coverDate', ''))
+                journal_name = citing_article.get('prism:publicationName', 'N/A')
+                volume = citing_article.get('prism:volume', '')
+                issue = citing_article.get('prism:issueIdentifier', '')
+
+                publication_info = f"{journal_name}"
+                if volume:
+                    publication_info += f", Vol. {volume}"
+                if issue:
+                    publication_info += f", Issue {issue}"
+
+                processed_data.append({
+                    'Target Article': clean_article_title(article['title']),
+                    'Citing Article': title,
+                    'Publication Date': pub_date,
+                    'Publication Year': year,
+                    'Publication Details': publication_info,
+                    'Citation Type': 'Referenced By'
+                })
+
+        logger.info(f"Successfully processed {len(processed_data)} citations.")
+        return processed_data
+
+    except Exception as e:
+        logger.error(f"Error processing batch citations: {str(e)}")
+        raise Exception(f"Error processing batch citations: {str(e)}")
+
+def process_citing_articles(citing_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Process a single article's citing articles data."""
+    try:
+        if not citing_data or 'error' in citing_data or 'citing-articles' not in citing_data:
+            return []
+        articles = citing_data['citing-articles'].get('article', [])
+        if not articles:
+            return []
+
+        processed_data = []
+        for article in articles:
+            title = clean_article_title(article.get('dc:title', ''))
+            pub_date, year = parse_publication_date(article.get('prism:coverDate', ''))
+
+            processed_data.append({
+                'Citing Article': title,
+                'Publication Date': pub_date,
+                'Publication Year': year,
+                'Citation Type': 'Primary Citation'
+            })
+
+        # Sort by publication date descending
+        processed_data.sort(
+            key=lambda x: pd.to_datetime(x['Publication Date'])
+            if x['Publication Date'] != 'N/A' else pd.Timestamp.min,
+            reverse=True
+        )
+
+        return processed_data
+    except Exception as e:
+        logger.error(f"Error processing citing articles: {str(e)}")
+        raise Exception(f"Error processing citing articles: {str(e)}")
+
+def export_citing_articles(citing_data: Dict[str, Any], target_info: Optional[Dict[str, str]] = None) -> bytes:
+    """Export citing articles data to Excel."""
+    try:
+        if target_info:
+            processed_data = process_batch_citations([target_info], [citing_data])
+        else:
+            processed_data = process_citing_articles(citing_data)
+
+        df = pd.DataFrame(processed_data)
+        if 'Publication Date' in df.columns:
+            df['Publication Date'] = pd.to_datetime(df['Publication Date'], errors='coerce')
+            df['Publication Date'] = df['Publication Date'].dt.strftime('%Y-%m-%d').fillna('N/A')
+            df['Publication Year'] = pd.to_datetime(df['Publication Date'], errors='coerce').dt.year
+            df['Publication Year'] = df['Publication Year'].astype('Int64').fillna(-1)
+            df.loc[df['Publication Year'] == -1, 'Publication Year'] = 'N/A'
+
+        output = io.BytesIO()
+        df.to_excel(output, engine='openpyxl', index=False)
+        output.seek(0)
+        return output.getvalue()
+
+    except Exception as e:
+        logger.error(f"Error exporting citing articles: {str(e)}")
+        raise Exception(f"Error exporting citing articles: {str(e)}")
+
+def process_article_search(search_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Process article search results from SCOPUS API."""
+    try:
+        if 'search-results' not in search_data:
+            return []
+        entries = search_data['search-results'].get('entry', [])
+        processed_data = []
+
+        for entry in entries:
+            title = clean_article_title(entry.get('dc:title', ''))
+            pub_date, year = parse_publication_date(entry.get('prism:coverDate', ''))
+            processed_data.append({
+                'Title': title,
+                'Year': year,
+                'EID': entry.get('eid', 'N/A'),
+                'Citation Count': entry.get('citedby-count', 0)
+            })
+
+        return processed_data
+
+    except Exception as e:
+        logger.error(f"Error processing article search results: {str(e)}")
+        raise Exception(f"Error processing article search results: {str(e)}")
+
+
+# ---------------------------------
+# SCOPUS API Functions (Previously in scopus_api)
+# ---------------------------------
+@sleep_and_retry
+@limits(calls=CALLS_PER_MINUTE, period=60)
+def search_article_by_title(title: str) -> Dict[str, Any]:
+    """Search for articles by title using the SCOPUS Search API."""
+    if not SCOPUS_API_KEY:
+        raise Exception("No SCOPUS API key provided.")
+
+    headers = {
+        'X-ELS-APIKey': SCOPUS_API_KEY,
+        'Accept': 'application/json',
+    }
+
+    params = {
+        'query': f'TITLE("{title}")',
+        'view': 'COMPLETE'
+    }
+
+    logger.debug(f"Searching for article with title: {title}")
+
+    response = requests.get(f'{BASE_URL}/content/search/scopus', headers=headers, params=params)
+    if response.status_code == 429:
+        time.sleep(60)
+        return search_article_by_title(title)
+    response.raise_for_status()
+    return response.json()
+
+@sleep_and_retry
+@limits(calls=CALLS_PER_MINUTE, period=60)
+def validate_eid(eid: str) -> bool:
+    """Validate EID format."""
+    return bool(eid and eid.startswith('2-s2.0-') and len(eid) >= 11)
+
+def validate_api_permissions() -> (bool, str):
+    """Validate API key permissions for citation access."""
+    if not SCOPUS_API_KEY:
+        return False, "No API key provided. Please set SCOPUS_API_KEY."
+    headers = {'X-ELS-APIKey': SCOPUS_API_KEY, 'Accept': 'application/json'}
+    test_url = f'{BASE_URL}/content/abstract/citation-count/2-s2.0-85123456789'
+    response = requests.get(test_url, headers=headers)
+
+    if response.status_code == 401:
+        return False, "Invalid API key. Please check if your API key is correct."
+    elif response.status_code == 403:
+        return False, ("Your API key doesn't have citation access permissions. "
+                       "Ensure your subscription includes the Citation Overview API.")
+    return True, "API permissions validated successfully."
+
+def get_citing_articles(eid: str, retry_count: int = 0) -> Dict[str, Any]:
+    """Get citing articles for a specific EID using the SCOPUS API."""
+    if not validate_eid(eid):
+        raise ValueError(f"Invalid EID format: {eid}")
+
+    has_permission, message = validate_api_permissions()
+    if not has_permission:
+        raise PermissionError(message)
+
+    headers = {
+        'X-ELS-APIKey': SCOPUS_API_KEY,
+        'Accept': 'application/json',
+        'X-ELS-Insttoken': os.environ.get('SCOPUS_INSTTOKEN', ''),
+    }
+
+    params = {
+        'query': f'REFEID({eid})',
+        'field': 'dc:title,prism:coverDate,prism:publicationName,prism:volume,prism:issueIdentifier',
+        'sort': 'coverdate desc',
+        'count': 200
+    }
+
+    url = f'{BASE_URL}/content/search/scopus'
+    response = requests.get(url, headers=headers, params=params)
+
+    if response.status_code == 401:
+        raise Exception("API authentication failed: Invalid API key or missing credentials.")
+
+    if response.status_code == 403:
+        raise Exception("API authorization failed: Your API key may not have sufficient permissions.")
+
+    if response.status_code == 429:
+        if retry_count < MAX_RETRIES:
+            wait_time = int(response.headers.get('X-RateLimit-Reset', 60))
+            time.sleep(wait_time)
+            return get_citing_articles(eid, retry_count + 1)
+        else:
+            raise Exception("Rate limit exceeded: Maximum retry attempts reached. Please try again later.")
+
+    response.raise_for_status()
+    data = response.json()
+
+    if 'search-results' not in data:
+        return {"error": "No citation data found", "details": "The API response did not contain search results."}
+
+    entries = data['search-results'].get('entry', [])
+    total_results = int(data['search-results'].get('opensearch:totalResults', 0))
+
+    if not entries:
+        return {"error": "No citations", "details": "No citing articles found for this publication."}
+
+    return {
+        'citing-articles': {
+            'article': entries,
+            'opensearch:totalResults': total_results
+        }
+    }
+
+def process_article_batch(batch: List[Dict[str, str]], progress_callback=None) -> List[Dict[str, Any]]:
+    """Process a batch of articles and return their citing articles data."""
+    results = []
+    total_in_batch = len(batch)
+    for i, article in enumerate(batch, 1):
+        try:
+            citing_data = get_citing_articles(article['eid'])
+            results.append(citing_data)
+            if progress_callback:
+                progress_callback((i / total_in_batch))
+        except Exception as e:
+            logger.error(f"Error processing article {article['eid']}: {str(e)}")
+            results.append({"error": str(e)})
+        time.sleep(1)
+    return results
+
+def process_retry_queue(retry_queue: List[Dict[str, str]], progress_callback=None) -> List[Dict[str, Any]]:
+    """Retry processing articles that failed due to rate limiting with increased delays."""
+    retry_results = []
+    for i, article in enumerate(retry_queue):
+        try:
+            result = get_citing_articles(article['eid'])
+            retry_results.append(result)
+            if progress_callback:
+                progress_callback((i + 1) / len(retry_queue))
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"Retry failed for article {article['eid']}: {str(e)}")
+            retry_results.append({
+                'error': True,
+                'eid': article['eid'],
+                'error_message': 'Retry failed',
+                'details': str(e)
+            })
+    return retry_results
+
+def batch_get_citing_articles(articles: List[Dict[str, str]], progress_callback=None) -> List[Dict[str, Any]]:
+    """Get citing articles for a batch of articles."""
+    results = []
+    total_articles = len(articles)
+    processed_count = 0
+    failed_articles = []
+    retry_queue = []
+
+    # Validate EIDs before processing
+    valid_articles = []
+    for article in articles:
+        if not article.get('eid') or not validate_eid(article['eid']):
+            failed_articles.append({
+                'eid': article.get('eid', 'Unknown'),
+                'error': 'Invalid EID format',
+                'details': 'EID must start with "2-s2.0-" and be at least 11 characters'
+            })
+        else:
+            valid_articles.append(article)
+
+    articles = valid_articles
+    for i in range(0, len(articles), BATCH_SIZE):
+        batch = articles[i:i + BATCH_SIZE]
+        batch_size = len(batch)
+
+        def batch_progress_callback(progress):
+            if progress_callback:
+                current_progress = (processed_count + progress * batch_size) / total_articles
+                progress_callback(current_progress)
+
+        try:
+            batch_results = process_article_batch(batch, batch_progress_callback)
+            for article, result in zip(batch, batch_results):
+                if isinstance(result, dict) and 'error' in result:
+                    failed_articles.append({
+                        'eid': article['eid'],
+                        'error': result['error'],
+                        'details': result.get('details', 'No additional details')
+                    })
+                else:
+                    results.append(result)
+
+            processed_count += batch_size
+            if i + BATCH_SIZE < len(articles):
+                time.sleep(2)
+
+        except Exception as e:
+            logger.error(f"Error processing batch: {str(e)}")
+            for article in batch:
+                failed_articles.append({
+                    'eid': article['eid'],
+                    'error': 'Batch processing error',
+                    'details': str(e)
+                })
+
+    # Retry logic if needed (here it's just a placeholder if you'd implement rate-limit logic)
+    if retry_queue:
+        retry_results = process_retry_queue(retry_queue, progress_callback)
+        results.extend(retry_results)
+
+    # Append failed articles to results for visibility
+    if failed_articles:
+        results.extend([{'error': True, **failed} for failed in failed_articles])
+
+    return results
+
+# ---------------------------------
+# Styling (Previously in styles)
+# ---------------------------------
+def apply_styles():
+    """Apply custom CSS styles to the Streamlit application."""
+    st.markdown("""
+        <style>
+        .main {
+            padding: 2rem;
+        }
+        h1 {
+            color: #1f77b4;
+            font-family: 'Times New Roman', serif;
+            margin-bottom: 2rem;
+        }
+        h3 {
+            color: #2c3e50;
+            font-family: 'Arial', sans-serif;
+            margin-bottom: 1.5rem;
+        }
+        .stButton>button {
+            background-color: #1f77b4;
+            color: white;
+            border-radius: 4px;
+            padding: 0.5rem 1rem;
+            font-weight: 500;
+        }
+        .stProgress > div > div > div {
+            background-color: #1f77b4;
+        }
+        .stDataFrame {
+            margin: 1rem 0;
+        }
+        .css-1d391kg {
+            padding: 1rem;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+
+# ---------------------------------
+# Streamlit Application
+# ---------------------------------
+def initialize_session_state():
+    """Initialize Streamlit session state variables."""
+    if 'has_api_key' not in st.session_state:
+        st.session_state.has_api_key = False
+    if 'search_results' not in st.session_state:
+        st.session_state.search_results = None
+    if 'citing_articles' not in st.session_state:
+        st.session_state.citing_articles = None
+    if 'batch_results' not in st.session_state:
+        st.session_state.batch_results = None
+    logger.debug("Session state initialized")
+
+def check_api_key():
+    """Check and validate API key presence."""
+    api_key = os.environ.get('SCOPUS_API_KEY', '')
+    if api_key:
+        st.session_state.has_api_key = True
+        logger.debug("API key found")
+    else:
+        st.session_state.has_api_key = False
+        logger.debug("No API key found")
+    return bool(api_key)
+
+def display_article_results(articles_data):
+    """Display article search results in a Streamlit dataframe."""
+    if articles_data:
+        df = pd.DataFrame(articles_data)
+        st.dataframe(df, use_container_width=True)
+        return df
+    return None
+
+def display_citing_articles(citing_data, target_info=None):
+    """Display citing articles and provide a download option."""
+    if citing_data:
+        if target_info:
+            processed_data = process_batch_citations([target_info], [citing_data])
+        else:
+            processed_data = process_citing_articles(citing_data)
+
+        if processed_data:
+            st.subheader("Citing Articles")
+            df = pd.DataFrame(processed_data)
+
+            if 'Publication Date' in df.columns:
+                df['Publication Date'] = pd.to_datetime(df['Publication Date'], errors='coerce')
+                df['Publication Year'] = df['Publication Date'].dt.year
+                df['Publication Year'] = df['Publication Year'].astype('Int64').astype(str).replace('<NA>', 'N/A')
+                df['Publication Date'] = df['Publication Date'].dt.strftime('%Y-%m-%d').fillna('N/A')
+
+            st.dataframe(df, use_container_width=True)
+            excel_data = export_citing_articles(citing_data, target_info)
+            st.download_button(
+                label="📥 Download Citing Articles",
+                data=excel_data,
+                file_name="citing_articles.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        else:
+            st.info("No citing articles found for this publication.")
+
+def get_article_title(df, eid):
+    """Get article title from a dataframe based on EID."""
+    try:
+        return df.loc[df['EID'] == eid, 'Title'].iloc[0]
+    except:
+        return eid
+
+def batch_processing_section():
+    """Handle batch processing of articles using an uploaded Excel file."""
+    st.subheader("Batch Processing")
+    st.markdown("""
+        **Upload an Excel file with the following columns:**
+        - EID: Scopus article ID
+        - Title: Article title
+    """)
+
+    uploaded_file = st.file_uploader("Upload Excel file", type=['xlsx', 'xls'])
+    if uploaded_file:
+        try:
+            articles = process_excel_input(uploaded_file)
+            st.success(f"Successfully validated {len(articles)} articles")
+
+            preview_df = pd.DataFrame(articles)
+            st.subheader("Preview")
+            st.dataframe(preview_df.head(), use_container_width=True)
+
+            if st.button("Process Batch"):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                current_article = st.empty()
+
+                def update_progress(progress):
+                    progress_bar.progress(progress)
+                    article_index = int(progress * len(articles))
+                    if article_index < len(articles):
+                        current_article.text(
+                            f"Processing {article_index + 1}/{len(articles)}: {articles[article_index]['title']}"
+                        )
+                    status_text.text(f"Progress: {int(progress * 100)}%")
+
+                citing_data_list = batch_get_citing_articles(articles, update_progress)
+                processed_results = process_batch_citations(articles, citing_data_list)
+                current_article.empty()
+
+                if processed_results:
+                    st.session_state.batch_results = processed_results
+                    status_text.success(f"Completed! Processed {len(processed_results)} citations")
+
+                    df = pd.DataFrame(processed_results)
+                    st.dataframe(df, use_container_width=True)
+
+                    output = io.BytesIO()
+                    df.to_excel(output, engine='openpyxl', index=False)
+                    output.seek(0)
+
+                    st.download_button(
+                        label="📥 Download Results",
+                        data=output.getvalue(),
+                        file_name="batch_citations.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                else:
+                    st.warning("No citation data found")
+                    st.session_state.batch_results = None
+
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+            logger.error(f"Batch processing error: {str(e)}")
+
+def main():
+    try:
+        logger.info("Starting application")
+
+        # Configure Streamlit page
+        st.set_page_config(
+            page_title="Citation Analysis Tool",
+            page_icon="📊",
+            layout="wide",
+            initial_sidebar_state="expanded",
+            menu_items={'About': 'Citation Analysis Tool - SCOPUS Integration'}
+        )
+
+        initialize_session_state()
+        apply_styles()
+
+        st.title("Citation Analysis Tool")
+        st.markdown("### Search and analyze citations using SCOPUS data")
+
+        has_api_key = check_api_key()
+
+        with st.expander("API Configuration", expanded=not has_api_key):
+            st.info("Enter your SCOPUS API Key to begin")
+            api_key = st.text_input("SCOPUS API Key", type="password")
+            if api_key:
+                os.environ['SCOPUS_API_KEY'] = api_key
+                try:
+                    perm_ok, message = validate_api_permissions()
+                    if perm_ok:
+                        st.session_state.has_api_key = True
+                        st.success("API Key configured successfully!")
+                    else:
+                        st.error(message)
+                        st.session_state.has_api_key = False
+                except Exception as e:
+                    st.error(f"Error validating API key: {str(e)}")
+                    st.session_state.has_api_key = False
+            elif has_api_key:
+                st.success("API Key is valid")
+
+        if st.session_state.has_api_key:
+            tab1, tab2 = st.tabs(["Single Search", "Batch Processing"])
+
+            with tab1:
+                st.subheader("Search Articles")
+                search_type = st.radio("Search by:", ["Title", "EID"], horizontal=True)
+
+                if search_type == "Title":
+                    search_query = st.text_input("Enter article title")
+                    if st.button("Search") and search_query:
+                        with st.spinner("Searching..."):
+                            try:
+                                results = search_article_by_title(search_query)
+                                if results:
+                                    st.session_state.search_results = process_article_search(results)
+                            except Exception as e:
+                                st.error(f"Search error: {str(e)}")
+
+                else:  # EID search
+                    eid = st.text_input("Enter article EID")
+                    if st.button("Get Citations") and eid:
+                        with st.spinner("Fetching citations..."):
+                            try:
+                                citing_data = get_citing_articles(eid)
+                                st.session_state.citing_articles = citing_data
+                            except Exception as e:
+                                st.error(f"Citation error: {str(e)}")
+
+                if st.session_state.search_results:
+                    st.subheader("Search Results")
+                    results_df = display_article_results(st.session_state.search_results)
+
+                    if results_df is not None and not results_df.empty:
+                        selected_eid = st.selectbox(
+                            "Select article to view citations:",
+                            results_df['EID'].tolist(),
+                            format_func=lambda x: get_article_title(results_df, x)
+                        )
+
+                        if st.button("Get Citations for Selected"):
+                            with st.spinner("Fetching citations..."):
+                                try:
+                                    citing_data = get_citing_articles(selected_eid)
+                                    st.session_state.citing_articles = citing_data
+                                except Exception as e:
+                                    st.error(f"Citation error: {str(e)}")
+
+                if st.session_state.citing_articles:
+                    display_citing_articles(st.session_state.citing_articles)
+
+            with tab2:
+                batch_processing_section()
+
+        else:
+            st.info("Please configure your SCOPUS API key to begin")
+
+    except Exception as e:
+        logger.error(f"Application error: {str(e)}")
+        st.error(f"An unexpected error occurred: {str(e)}")
+
+if __name__ == "__main__":
+    main()
